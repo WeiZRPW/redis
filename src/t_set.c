@@ -193,7 +193,7 @@ sds setTypeNextObject(setTypeIterator *si) {
 }
 
 /* Return random element from a non empty set.
- * The returned element can be a int64_t value if the set is encoded
+ * The returned element can be an int64_t value if the set is encoded
  * as an "intset" blob of integers, or an SDS string if the set
  * is a regular set.
  *
@@ -259,6 +259,42 @@ void setTypeConvert(robj *setobj, int enc) {
     } else {
         serverPanic("Unsupported set conversion");
     }
+}
+
+/* This is a helper function for the COPY command.
+ * Duplicate a set object, with the guarantee that the returned object
+ * has the same encoding as the original one.
+ *
+ * The resulting object always has refcount set to 1 */
+robj *setTypeDup(robj *o) {
+    robj *set;
+    setTypeIterator *si;
+    sds elesds;
+    int64_t intobj;
+
+    serverAssert(o->type == OBJ_SET);
+
+    /* Create a new set object that have the same encoding as the original object's encoding */
+    if (o->encoding == OBJ_ENCODING_INTSET) {
+        intset *is = o->ptr;
+        size_t size = intsetBlobLen(is);
+        intset *newis = zmalloc(size);
+        memcpy(newis,is,size);
+        set = createObject(OBJ_SET, newis);
+        set->encoding = OBJ_ENCODING_INTSET;
+    } else if (o->encoding == OBJ_ENCODING_HT) {
+        set = createSetObject();
+        dict *d = o->ptr;
+        dictExpand(set->ptr, dictSize(d));
+        si = setTypeInitIterator(o);
+        while (setTypeNext(si, &elesds, &intobj) != -1) {
+            setTypeAdd(set, elesds);
+        }
+        setTypeReleaseIterator(si);
+    } else {
+        serverPanic("Unknown set encoding");
+    }
+    return set;
 }
 
 void saddCommand(client *c) {
@@ -458,7 +494,7 @@ void spopWithCountCommand(client *c) {
         dbDelete(c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
 
-        /* Propagate this command as an DEL operation */
+        /* Propagate this command as a DEL operation */
         rewriteClientCommandVector(c,2,shared.del,c->argv[1]);
         signalModifiedKey(c,c->db,c->argv[1]);
         server.dirty++;
@@ -692,9 +728,9 @@ void srandmemberWithCountCommand(client *c) {
      * In this case we create a set from scratch with all the elements, and
      * subtract random elements to reach the requested number of elements.
      *
-     * This is done because if the number of requsted elements is just
+     * This is done because if the number of requested elements is just
      * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 3 is highly inefficient. */
+     * used into CASE 4 is highly inefficient. */
     if (count*SRANDMEMBER_SUB_STRATEGY_MUL > size) {
         setTypeIterator *si;
 
@@ -1080,7 +1116,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
             sdsfree(ele);
         }
         setTypeReleaseIterator(si);
-        server.lazyfree_lazy_server_del ? freeObjAsync(dstset) :
+        server.lazyfree_lazy_server_del ? freeObjAsync(NULL, dstset) :
                                           decrRefCount(dstset);
     } else {
         /* If we have a target key where to store the resulting set

@@ -87,7 +87,7 @@ void discardTransaction(client *c) {
     unwatchAllKeys(c);
 }
 
-/* Flag the transacation as DIRTY_EXEC so that EXEC will fail.
+/* Flag the transaction as DIRTY_EXEC so that EXEC will fail.
  * Should be called every time there is an error while queueing a command. */
 void flagTransaction(client *c) {
     if (c->flags & CLIENT_MULTI)
@@ -100,6 +100,7 @@ void multiCommand(client *c) {
         return;
     }
     c->flags |= CLIENT_MULTI;
+
     addReply(c,shared.ok);
 }
 
@@ -127,7 +128,8 @@ void execCommandPropagateExec(client *c) {
 /* Aborts a transaction, with a specific error message.
  * The transaction is always aboarted with -EXECABORT so that the client knows
  * the server exited the multi state, but the actual reason for the abort is
- * included too. */
+ * included too.
+ * Note: 'error' may or may not end with \r\n. see addReplyErrorFormat. */
 void execCommandAbort(client *c, sds error) {
     discardTransaction(c);
 
@@ -167,6 +169,11 @@ void execCommand(client *c) {
         goto handle_monitor;
     }
 
+    uint64_t old_flags = c->flags;
+
+    /* we do not want to allow blocking commands inside multi */
+    c->flags |= CLIENT_DENY_BLOCKING;
+
     /* Exec all the queued commands */
     unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
     orig_argv = c->argv;
@@ -191,20 +198,37 @@ void execCommand(client *c) {
             must_propagate = 1;
         }
 
-        int acl_keypos;
-        int acl_retval = ACLCheckCommandPerm(c,&acl_keypos);
+        /* ACL permissions are also checked at the time of execution in case
+         * they were changed after the commands were ququed. */
+        int acl_errpos;
+        int acl_retval = ACLCheckCommandPerm(c,&acl_errpos);
+        if (acl_retval == ACL_OK && c->cmd->proc == publishCommand)
+            acl_retval = ACLCheckPubsubPerm(c,1,1,0,&acl_errpos);
         if (acl_retval != ACL_OK) {
-            addACLLogEntry(c,acl_retval,acl_keypos,NULL);
+            char *reason;
+            switch (acl_retval) {
+            case ACL_DENIED_CMD:
+                reason = "no permission to execute the command or subcommand";
+                break;
+            case ACL_DENIED_KEY:
+                reason = "no permission to touch the specified keys";
+                break;
+            case ACL_DENIED_CHANNEL:
+                reason = "no permission to publish to the specified channel";
+                break;
+            default:
+                reason = "no permission";
+                break;
+            }
+            addACLLogEntry(c,acl_retval,acl_errpos,NULL);
             addReplyErrorFormat(c,
                 "-NOPERM ACLs rules changed between the moment the "
                 "transaction was accumulated and the EXEC call. "
                 "This command is no longer allowed for the "
-                "following reason: %s",
-                (acl_retval == ACL_DENIED_CMD) ?
-                "no permission to execute the command or subcommand" :
-                "no permission to touch the specified keys");
+                "following reason: %s", reason);
         } else {
             call(c,server.loading ? CMD_CALL_NONE : CMD_CALL_FULL);
+            serverAssert((c->flags & CLIENT_BLOCKED) == 0);
         }
 
         /* Commands may alter argc/argv, restore mstate. */
@@ -212,6 +236,11 @@ void execCommand(client *c) {
         c->mstate.commands[j].argv = c->argv;
         c->mstate.commands[j].cmd = c->cmd;
     }
+
+    // restore old DENY_BLOCKING value
+    if (!(old_flags & CLIENT_DENY_BLOCKING))
+        c->flags &= ~CLIENT_DENY_BLOCKING;
+
     c->argv = orig_argv;
     c->argc = orig_argc;
     c->cmd = orig_cmd;
