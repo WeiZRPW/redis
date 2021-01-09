@@ -18,6 +18,7 @@ set ::all_tests {
     unit/protocol
     unit/keyspace
     unit/scan
+    unit/info
     unit/type/string
     unit/type/incr
     unit/type/list
@@ -44,6 +45,8 @@ set ::all_tests {
     integration/replication-psync
     integration/aof
     integration/rdb
+    integration/corrupt-dump
+    integration/corrupt-dump-fuzzer
     integration/convert-zipmap-hash-on-load
     integration/logging
     integration/psync2
@@ -178,6 +181,10 @@ proc reconnect {args} {
     set port [dict get $srv "port"]
     set config [dict get $srv "config"]
     set client [redis $host $port 0 $::tls]
+    if {[dict exists $srv "client"]} {
+        set old [dict get $srv "client"]
+        $old close
+    }
     dict set srv "client" $client
 
     # select the right db when we don't have to authenticate
@@ -255,7 +262,7 @@ proc test_server_main {} {
     set tclsh [info nameofexecutable]
     # Open a listening socket, trying different ports in order to find a
     # non busy one.
-    set clientport [find_available_port 11111 32]
+    set clientport [find_available_port [expr {$::baseport - 32}] 32]
     if {!$::quiet} {
         puts "Starting test server at port $clientport"
     }
@@ -596,8 +603,8 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         set ::tls 1
         ::tls::init \
             -cafile "$::tlsdir/ca.crt" \
-            -certfile "$::tlsdir/redis.crt" \
-            -keyfile "$::tlsdir/redis.key"
+            -certfile "$::tlsdir/client.crt" \
+            -keyfile "$::tlsdir/client.key"
     } elseif {$opt eq {--host}} {
         set ::external 1
         set ::host $arg

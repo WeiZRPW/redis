@@ -457,13 +457,8 @@ void spopWithCountCommand(client *c) {
     robj *set;
 
     /* Get the count argument */
-    if (getLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
-    if (l >= 0) {
-        count = (unsigned long) l;
-    } else {
-        addReply(c,shared.outofrangeerr);
-        return;
-    }
+    if (getPositiveLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
+    count = (unsigned long) l;
 
     /* Make sure a key with the name inputted exists, and that it's type is
      * indeed a set. Otherwise, return nil */
@@ -481,7 +476,7 @@ void spopWithCountCommand(client *c) {
 
     /* Generate an SPOP keyspace notification */
     notifyKeyspaceEvent(NOTIFY_SET,"spop",c->argv[1],c->db->id);
-    server.dirty += count;
+    server.dirty += (count >= size) ? size : count;
 
     /* CASE 1:
      * The number of requested elements is greater than or equal to
@@ -497,7 +492,6 @@ void spopWithCountCommand(client *c) {
         /* Propagate this command as a DEL operation */
         rewriteClientCommandVector(c,2,shared.del,c->argv[1]);
         signalModifiedKey(c,c->db,c->argv[1]);
-        server.dirty++;
         return;
     }
 
@@ -599,7 +593,6 @@ void spopWithCountCommand(client *c) {
     decrRefCount(propargv[0]);
     preventCommandPropagation(c);
     signalModifiedKey(c,c->db,c->argv[1]);
-    server.dirty++;
 }
 
 void spopCommand(client *c) {
@@ -612,7 +605,7 @@ void spopCommand(client *c) {
         spopWithCountCommand(c);
         return;
     } else if (c->argc > 3) {
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
@@ -808,7 +801,7 @@ void srandmemberCommand(client *c) {
         srandmemberWithCountCommand(c);
         return;
     } else if (c->argc > 3) {
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 

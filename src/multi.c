@@ -113,15 +113,29 @@ void discardCommand(client *c) {
     addReply(c,shared.ok);
 }
 
+void beforePropagateMultiOrExec(int multi) {
+    if (multi) {
+        /* Propagating MULTI */
+        serverAssert(!server.propagate_in_transaction);
+        server.propagate_in_transaction = 1;
+    } else {
+        /* Propagating EXEC */
+        serverAssert(server.propagate_in_transaction == 1);
+        server.propagate_in_transaction = 0;
+    }
+}
+
 /* Send a MULTI command to all the slaves and AOF file. Check the execCommand
  * implementation for more information. */
-void execCommandPropagateMulti(client *c) {
-    propagate(server.multiCommand,c->db->id,&shared.multi,1,
+void execCommandPropagateMulti(int dbid) {
+    beforePropagateMultiOrExec(1);
+    propagate(server.multiCommand,dbid,&shared.multi,1,
               PROPAGATE_AOF|PROPAGATE_REPL);
 }
 
-void execCommandPropagateExec(client *c) {
-    propagate(server.execCommand,c->db->id,&shared.exec,1,
+void execCommandPropagateExec(int dbid) {
+    beforePropagateMultiOrExec(0);
+    propagate(server.execCommand,dbid,&shared.exec,1,
               PROPAGATE_AOF|PROPAGATE_REPL);
 }
 
@@ -148,7 +162,6 @@ void execCommand(client *c) {
     robj **orig_argv;
     int orig_argc;
     struct redisCommand *orig_cmd;
-    int must_propagate = 0; /* Need to propagate MULTI/EXEC to AOF / slaves? */
     int was_master = server.masterhost == NULL;
 
     if (!(c->flags & CLIENT_MULTI)) {
@@ -176,6 +189,9 @@ void execCommand(client *c) {
 
     /* Exec all the queued commands */
     unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
+
+    server.in_exec = 1;
+
     orig_argv = c->argv;
     orig_argc = c->argc;
     orig_cmd = c->cmd;
@@ -184,19 +200,6 @@ void execCommand(client *c) {
         c->argc = c->mstate.commands[j].argc;
         c->argv = c->mstate.commands[j].argv;
         c->cmd = c->mstate.commands[j].cmd;
-
-        /* Propagate a MULTI request once we encounter the first command which
-         * is not readonly nor an administrative one.
-         * This way we'll deliver the MULTI/..../EXEC block as a whole and
-         * both the AOF and the replication link will have the same consistency
-         * and atomicity guarantees. */
-        if (!must_propagate &&
-            !server.loading &&
-            !(c->cmd->flags & (CMD_READONLY|CMD_ADMIN)))
-        {
-            execCommandPropagateMulti(c);
-            must_propagate = 1;
-        }
 
         /* ACL permissions are also checked at the time of execution in case
          * they were changed after the commands were ququed. */
@@ -248,9 +251,10 @@ void execCommand(client *c) {
 
     /* Make sure the EXEC command will be propagated as well if MULTI
      * was already propagated. */
-    if (must_propagate) {
+    if (server.propagate_in_transaction) {
         int is_master = server.masterhost == NULL;
         server.dirty++;
+        beforePropagateMultiOrExec(0);
         /* If inside the MULTI/EXEC block this instance was suddenly
          * switched from master to slave (using the SLAVEOF command), the
          * initial MULTI was propagated into the replication backlog, but the
@@ -261,6 +265,8 @@ void execCommand(client *c) {
             feedReplicationBacklog(execcmd,strlen(execcmd));
         }
     }
+
+    server.in_exec = 0;
 
 handle_monitor:
     /* Send EXEC to clients waiting data from MONITOR. We do it here
@@ -368,31 +374,36 @@ void touchWatchedKey(redisDb *db, robj *key) {
     }
 }
 
-/* On FLUSHDB or FLUSHALL all the watched keys that are present before the
- * flush but will be deleted as effect of the flushing operation should
- * be touched. "dbid" is the DB that's getting the flush. -1 if it is
- * a FLUSHALL operation (all the DBs flushed). */
-void touchWatchedKeysOnFlush(int dbid) {
-    listIter li1, li2;
+/* Set CLIENT_DIRTY_CAS to all clients of DB when DB is dirty.
+ * It may happen in the following situations:
+ * FLUSHDB, FLUSHALL, SWAPDB
+ *
+ * replaced_with: for SWAPDB, the WATCH should be invalidated if
+ * the key exists in either of them, and skipped only if it
+ * doesn't exist in both. */
+void touchAllWatchedKeysInDb(redisDb *emptied, redisDb *replaced_with) {
+    listIter li;
     listNode *ln;
+    dictEntry *de;
 
-    /* For every client, check all the waited keys */
-    listRewind(server.clients,&li1);
-    while((ln = listNext(&li1))) {
-        client *c = listNodeValue(ln);
-        listRewind(c->watched_keys,&li2);
-        while((ln = listNext(&li2))) {
-            watchedKey *wk = listNodeValue(ln);
+    if (dictSize(emptied->watched_keys) == 0) return;
 
-            /* For every watched key matching the specified DB, if the
-             * key exists, mark the client as dirty, as the key will be
-             * removed. */
-            if (dbid == -1 || wk->db->id == dbid) {
-                if (dictFind(wk->db->dict, wk->key->ptr) != NULL)
-                    c->flags |= CLIENT_DIRTY_CAS;
+    dictIterator *di = dictGetSafeIterator(emptied->watched_keys);
+    while((de = dictNext(di)) != NULL) {
+        robj *key = dictGetKey(de);
+        list *clients = dictGetVal(de);
+        if (!clients) continue;
+        listRewind(clients,&li);
+        while((ln = listNext(&li))) {
+            client *c = listNodeValue(ln);
+            if (dictFind(emptied->dict, key->ptr)) {
+                c->flags |= CLIENT_DIRTY_CAS;
+            } else if (replaced_with && dictFind(replaced_with->dict, key->ptr)) {
+                c->flags |= CLIENT_DIRTY_CAS;
             }
         }
     }
+    dictReleaseIterator(di);
 }
 
 void watchCommand(client *c) {

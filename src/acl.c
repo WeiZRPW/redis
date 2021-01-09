@@ -89,12 +89,15 @@ struct ACLUserFlag {
     const char *name;
     uint64_t flag;
 } ACLUserFlags[] = {
+    /* Note: the order here dictates the emitted order at ACLDescribeUser */
     {"on", USER_FLAG_ENABLED},
     {"off", USER_FLAG_DISABLED},
     {"allkeys", USER_FLAG_ALLKEYS},
     {"allchannels", USER_FLAG_ALLCHANNELS},
     {"allcommands", USER_FLAG_ALLCOMMANDS},
     {"nopass", USER_FLAG_NOPASS},
+    {"skip-sanitize-payload", USER_FLAG_SANITIZE_PAYLOAD_SKIP},
+    {"sanitize-payload", USER_FLAG_SANITIZE_PAYLOAD},
     {NULL,0} /* Terminator. */
 };
 
@@ -171,15 +174,15 @@ sds ACLHashPassword(unsigned char *cleartext, size_t len) {
     return sdsnewlen(hex,HASH_PASSWORD_LEN);
 }
 
-/* Given a hash and the hash length, returns C_OK if it is a valid password 
+/* Given a hash and the hash length, returns C_OK if it is a valid password
  * hash, or C_ERR otherwise. */
 int ACLCheckPasswordHash(unsigned char *hash, int hashlen) {
     if (hashlen != HASH_PASSWORD_LEN) {
-        return C_ERR;      
+        return C_ERR;
     }
- 
+
     /* Password hashes can only be characters that represent
-     * hexadecimal values, which are numbers and lowercase 
+     * hexadecimal values, which are numbers and lowercase
      * characters 'a' through 'f'. */
     for(int i = 0; i < HASH_PASSWORD_LEN; i++) {
         char c = hash[i];
@@ -829,6 +832,12 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
     } else if (!strcasecmp(op,"off")) {
         u->flags |= USER_FLAG_DISABLED;
         u->flags &= ~USER_FLAG_ENABLED;
+    } else if (!strcasecmp(op,"skip-sanitize-payload")) {
+        u->flags |= USER_FLAG_SANITIZE_PAYLOAD_SKIP;
+        u->flags &= ~USER_FLAG_SANITIZE_PAYLOAD;
+    } else if (!strcasecmp(op,"sanitize-payload")) {
+        u->flags &= ~USER_FLAG_SANITIZE_PAYLOAD_SKIP;
+        u->flags |= USER_FLAG_SANITIZE_PAYLOAD;
     } else if (!strcasecmp(op,"allkeys") ||
                !strcasecmp(op,"~*"))
     {
@@ -1004,6 +1013,7 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         serverAssert(ACLSetUser(u,"resetkeys",-1) == C_OK);
         serverAssert(ACLSetUser(u,"resetchannels",-1) == C_OK);
         serverAssert(ACLSetUser(u,"off",-1) == C_OK);
+        serverAssert(ACLSetUser(u,"sanitize-payload",-1) == C_OK);
         serverAssert(ACLSetUser(u,"-@all",-1) == C_OK);
     } else {
         errno = EINVAL;
@@ -2174,18 +2184,30 @@ void aclCommand(client *c) {
         }
     } else if (c->argc == 2 && !strcasecmp(sub,"help")) {
         const char *help[] = {
-"LOAD                             -- Reload users from the ACL file.",
-"SAVE                             -- Save the current config to the ACL file.",
-"LIST                             -- Show user details in config file format.",
-"USERS                            -- List all the registered usernames.",
-"SETUSER <username> [attribs ...] -- Create or modify a user.",
-"GETUSER <username>               -- Get the user details.",
-"DELUSER <username> [...]         -- Delete a list of users.",
-"CAT                              -- List available categories.",
-"CAT <category>                   -- List commands inside category.",
-"GENPASS [<bits>]                 -- Generate a secure user password.",
-"WHOAMI                           -- Return the current connection username.",
-"LOG [<count> | RESET]            -- Show the ACL log entries.",
+"CAT [<category>]",
+"    List all commands that belong to <category>, or all command categories",
+"    when no category is specified.",
+"DELUSER <username> [<username> ...]",
+"    Delete a list of users.",
+"GETUSER <username>",
+"    Get the user's details.",
+"GENPASS [<bits>]",
+"    Generate a secure 256-bit user password. The optional `bits` argument can",
+"    be used to specify a different size.",
+"LIST",
+"    Show users details in config file format.",
+"LOAD",
+"    Reload users from the ACL file.",
+"LOG [<count> | RESET]",
+"    Show the ACL log entries.",
+"SAVE",
+"    Save the current config to the ACL file.",
+"SETUSER <username> <attribute> [<attribute> ...]",
+"    Create or modify a user with the specified attributes.",
+"USERS",
+"    List all the registered usernames.",
+"WHOAMI",
+"    Return the current connection username.",
 NULL
         };
         addReplyHelp(c,help);
@@ -2214,7 +2236,7 @@ void addReplyCommandCategories(client *c, struct redisCommand *cmd) {
 void authCommand(client *c) {
     /* Only two or three argument forms are allowed. */
     if (c->argc > 3) {
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 

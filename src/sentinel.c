@@ -46,6 +46,7 @@ extern char **environ;
 
 #ifdef USE_OPENSSL
 extern SSL_CTX *redis_tls_ctx;
+extern SSL_CTX *redis_tls_client_ctx;
 #endif
 
 #define REDIS_SENTINEL_PORT 26379
@@ -418,7 +419,8 @@ dictType instancesDictType = {
     NULL,                      /* val dup */
     dictSdsKeyCompare,         /* key compare */
     NULL,                      /* key destructor */
-    dictInstancesValDestructor /* val destructor */
+    dictInstancesValDestructor,/* val destructor */
+    NULL                       /* allow to expand */
 };
 
 /* Instance runid (sds) -> votes (long casted to void*)
@@ -431,7 +433,8 @@ dictType leaderVotesDictType = {
     NULL,                      /* val dup */
     dictSdsKeyCompare,         /* key compare */
     NULL,                      /* key destructor */
-    NULL                       /* val destructor */
+    NULL,                      /* val destructor */
+    NULL                       /* allow to expand */
 };
 
 /* Instance renamed commands table. */
@@ -441,7 +444,8 @@ dictType renamedCommandsDictType = {
     NULL,                      /* val dup */
     dictSdsKeyCaseCompare,     /* key compare */
     dictSdsDestructor,         /* key destructor */
-    dictSdsDestructor          /* val destructor */
+    dictSdsDestructor,         /* val destructor */
+    NULL                       /* allow to expand */
 };
 
 /* =========================== Initialization =============================== */
@@ -465,7 +469,7 @@ struct redisCommand sentinelcmds[] = {
     {"client",clientCommand,-2,"admin random @connection",0,NULL,0,0,0,0,0},
     {"shutdown",shutdownCommand,-1,"admin",0,NULL,0,0,0,0,0},
     {"auth",authCommand,-2,"no-auth fast @connection",0,NULL,0,0,0,0,0},
-    {"hello",helloCommand,-2,"no-auth fast @connection",0,NULL,0,0,0,0,0},
+    {"hello",helloCommand,-1,"no-auth fast @connection",0,NULL,0,0,0,0,0},
     {"acl",aclCommand,-2,"admin",0,NULL,0,0,0,0,0,0},
     {"command",commandCommand,-1, "random @connection", 0,NULL,0,0,0,0,0,0}
 };
@@ -2074,7 +2078,7 @@ static int instanceLinkNegotiateTLS(redisAsyncContext *context) {
     (void) context;
 #else
     if (!redis_tls_ctx) return C_ERR;
-    SSL *ssl = SSL_new(redis_tls_ctx);
+    SSL *ssl = SSL_new(redis_tls_client_ctx ? redis_tls_client_ctx : redis_tls_ctx);
     if (!ssl) return C_ERR;
 
     if (redisInitiateSSL(&context->c, ssl) == REDIS_ERR) return C_ERR;
@@ -3086,25 +3090,45 @@ int sentinelIsQuorumReachable(sentinelRedisInstance *master, int *usableptr) {
 void sentinelCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
-"MASTERS -- Show a list of monitored masters and their state.",
-"MASTER <master-name> -- Show the state and info of the specified master.",
-"REPLICAS <master-name> -- Show a list of replicas for this master and their state.",
-"SENTINELS <master-name> -- Show a list of Sentinel instances for this master and their state.",
-"MYID -- Show Current Sentinel Id",
-"IS-MASTER-DOWN-BY-ADDR <ip> <port> <current-epoch> <runid> -- Check if the master specified by ip:port is down from current Sentinel's point of view.",
-"GET-MASTER-ADDR-BY-NAME <master-name> -- Return the ip and port number of the master with that name.",
-"RESET <pattern> -- Reset masters for specific master name matching this pattern.",
-"FAILOVER <master-name> -- Manually failover a master node without asking for agreement from other Sentinels",
-"PENDING-SCRIPTS -- Get pending scripts information.", 
-"MONITOR <name> <ip> <port> <quorum> -- Start monitoring a new master with the specified name, ip, port and quorum.",
-"FLUSHCONFIG -- Force Sentinel to rewrite its configuration on disk, including the current Sentinel state.",
-"REMOVE <master-name> -- Remove master from Sentinel's monitor list.",
-"CKQUORUM <master-name> -- Check if the current Sentinel configuration is able to reach the quorum needed to failover a master "
-"and the majority needed to authorize the failover.",
-"SET <master-name> <option> <value> -- Set configuration paramters for certain masters.",
-"INFO-CACHE <master-name> -- Return last cached INFO output from masters and all its replicas.",
-"SIMULATE-FAILURE (crash-after-election|crash-after-promotion|help) -- Simulate a Sentinel crash.",
-"HELP -- Prints this help.",
+"CKQUORUM <master-name>",
+"    Check if the current Sentinel configuration is able to reach the quorum",
+"    needed to failover a master and the majority needed to authorize the",
+"    failover.",
+"GET-MASTER-ADDR-BY-NAME <master-name>",
+"    Return the ip and port number of the master with that name.",
+"FAILOVER <master-name>",
+"    Manually failover a master node without asking for agreement from other",
+"    Sentinels",
+"FLUSHCONFIG",
+"    Force Sentinel to rewrite its configuration on disk, including the current",
+"    Sentinel state.",
+"INFO-CACHE <master-name>",
+"    Return last cached INFO output from masters and all its replicas.",
+"IS-MASTER-DOWN-BY-ADDR <ip> <port> <current-epoch> <runid>",
+"    Check if the master specified by ip:port is down from current Sentinel's",
+"    point of view.",
+"MASTER <master-name>",
+"    Show the state and info of the specified master.",
+"MASTERS",
+"    Show a list of monitored masters and their state.",
+"MONITOR <name> <ip> <port> <quorum>",
+"    Start monitoring a new master with the specified name, ip, port and quorum.",
+"MYID",
+"    Return the ID of the Sentinel instance.",
+"PENDING-SCRIPTS",
+"    Get pending scripts information.",
+"REMOVE <master-name>",
+"    Remove master from Sentinel's monitor list.",
+"REPLICAS <master-name>",
+"    Show a list of replicas for this master and their state.",
+"RESET <pattern>",
+"    Reset masters for specific master name matching this pattern.",
+"SENTINELS <master-name>",
+"    Show a list of Sentinel instances for this master and their state.",
+"SET <master-name> <option> <value>",
+"    Set configuration paramters for certain masters.",
+"SIMULATE-FAILURE (CRASH-AFTER-ELECTION|CRASH-AFTER-PROMOTION|HELP)",
+"    Simulate a Sentinel crash.",
 NULL
         };
         addReplyHelp(c, help);
@@ -3442,7 +3466,7 @@ numargserr:
 /* SENTINEL INFO [section] */
 void sentinelInfoCommand(client *c) {
     if (c->argc > 2) {
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
@@ -3575,14 +3599,13 @@ void sentinelSetCommand(client *c) {
                     "Reconfiguration of scripts path is denied for "
                     "security reasons. Check the deny-scripts-reconfig "
                     "configuration directive in your Sentinel configuration");
-                return;
+                goto seterr;
             }
 
             if (strlen(value) && access(value,X_OK) == -1) {
                 addReplyError(c,
                     "Notification script seems non existing or non executable");
-                if (changes) sentinelFlushConfig();
-                return;
+                goto seterr;
             }
             sdsfree(ri->notification_script);
             ri->notification_script = strlen(value) ? sdsnew(value) : NULL;
@@ -3595,15 +3618,14 @@ void sentinelSetCommand(client *c) {
                     "Reconfiguration of scripts path is denied for "
                     "security reasons. Check the deny-scripts-reconfig "
                     "configuration directive in your Sentinel configuration");
-                return;
+                goto seterr;
             }
 
             if (strlen(value) && access(value,X_OK) == -1) {
                 addReplyError(c,
                     "Client reconfiguration script seems non existing or "
                     "non executable");
-                if (changes) sentinelFlushConfig();
-                return;
+                goto seterr;
             }
             sdsfree(ri->client_reconfig_script);
             ri->client_reconfig_script = strlen(value) ? sdsnew(value) : NULL;
@@ -3653,8 +3675,7 @@ void sentinelSetCommand(client *c) {
         } else {
             addReplyErrorFormat(c,"Unknown option or number of arguments for "
                                   "SENTINEL SET '%s'", option);
-            if (changes) sentinelFlushConfig();
-            return;
+            goto seterr;
         }
 
         /* Log the event. */
@@ -3680,9 +3701,11 @@ void sentinelSetCommand(client *c) {
     return;
 
 badfmt: /* Bad format errors */
-    if (changes) sentinelFlushConfig();
     addReplyErrorFormat(c,"Invalid argument '%s' for SENTINEL SET '%s'",
         (char*)c->argv[badarg]->ptr,option);
+seterr:
+    if (changes) sentinelFlushConfig();
+    return;
 }
 
 /* Our fake PUBLISH command: it is actually useful only to receive hello messages
